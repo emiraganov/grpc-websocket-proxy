@@ -2,14 +2,30 @@ package wsproxy
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
+)
+
+const (
+	// Time allowed to write a message to the peer.
+	writeWait = 10 * time.Second
+
+	// Time allowed to read the next pong message from the peer.
+	pongWait = 60 * time.Second
+
+	// Send pings to peer with this period. Must be less than pongWait.
+	pingPeriod = (pongWait * 9) / 10
+
+	// Maximum message size allowed from peer.
+	maxMessageSize = 102400
 )
 
 // MethodOverrideParam defines the special URL parameter that is translated into the subsequent proxied streaming http request's method.
@@ -25,6 +41,8 @@ var TokenCookieName = "token"
 // RequestMutatorFunc can supply an alternate outgoing request.
 type RequestMutatorFunc func(incoming *http.Request, outgoing *http.Request) *http.Request
 
+type RequestParamsToBodyFunc func(incoming *http.Request, outgoing *http.Request) []byte
+
 // Proxy provides websocket transport upgrade to compatible endpoints.
 type Proxy struct {
 	h                   http.Handler
@@ -32,6 +50,7 @@ type Proxy struct {
 	methodOverrideParam string
 	tokenCookieName     string
 	requestMutator      RequestMutatorFunc
+	requestParamsToBody RequestParamsToBodyFunc
 	headerForwarder     func(header string) bool
 }
 
@@ -70,6 +89,13 @@ func WithTokenCookieName(param string) Option {
 func WithRequestMutator(fn RequestMutatorFunc) Option {
 	return func(p *Proxy) {
 		p.requestMutator = fn
+	}
+}
+
+// WithLogger allows a custom FieldLogger to be supplied
+func WithRequestParamsToBody(fn RequestParamsToBodyFunc) Option {
+	return func(p *Proxy) {
+		p.requestParamsToBody = fn
 	}
 }
 
@@ -153,7 +179,10 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 		p.logger.Warnln("error upgrading websocket:", err)
 		return
 	}
-	defer conn.Close()
+	defer func() {
+		p.logger.Debugln("closing connection")
+		conn.Close()
+	}()
 
 	ctx, cancelFn := context.WithCancel(context.Background())
 	defer cancelFn()
@@ -164,6 +193,9 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 		p.logger.Warnln("error preparing request:", err)
 		return
 	}
+
+	request = request.WithContext(ctx)
+
 	if swsp := r.Header.Get("Sec-WebSocket-Protocol"); swsp != "" {
 		request.Header.Set("Authorization", transformSubProtocolHeader(swsp))
 	}
@@ -184,6 +216,20 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 		request = p.requestMutator(r, request)
 	}
 
+	if p.requestParamsToBody != nil {
+		//Write is blocking operation and it must be done in another routine
+		//Unfortunately this breaks bidirectional streaming
+		go func() {
+			//JSONIZE PARAMS
+			bytes := p.requestParamsToBody(r, request)
+			p.logger.Debugln("Writing params in body as", string(bytes))
+			requestBodyW.Write(bytes)
+			requestBodyW.Write([]byte("\n"))
+			p.logger.Debugln("Writing finished")
+			// requestBodyW.Close() //You must close it if is a single stream
+		}()
+	}
+
 	responseBodyR, responseBodyW := io.Pipe()
 	response := newInMemoryResponseWriter(responseBodyW)
 	go func() {
@@ -196,7 +242,10 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 
 	go func() {
 		defer cancelFn()
+
+		p.logger.Debugln("serving http...")
 		p.h.ServeHTTP(response, request)
+		p.logger.Debugln("serving http...done")
 	}()
 
 	// read loop -- take messages from websocket and write to http request
@@ -204,6 +253,15 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			cancelFn()
 		}()
+
+		// conn.SetReadLimit(wsc.MaxMessageSize)
+		conn.SetReadDeadline(time.Now().Add(pongWait))
+		conn.SetPongHandler(func(string) error {
+			p.logger.Debugln("[read] pong")
+			conn.SetReadDeadline(time.Now().Add(pongWait))
+			return nil
+		})
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -212,6 +270,7 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 			default:
 			}
 			p.logger.Debugln("[read] reading from socket.")
+
 			_, payload, err := conn.ReadMessage()
 			if err != nil {
 				if isClosedConnError(err) {
@@ -221,7 +280,13 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 				p.logger.Warnln("error reading websocket message:", err)
 				return
 			}
+
 			p.logger.Debugln("[read] read payload:", string(payload))
+			if len(payload) == 0 {
+				p.logger.Debugln("[read] skiping empty payload")
+				continue
+			}
+
 			p.logger.Debugln("[read] writing to requestBody:")
 			n, err := requestBodyW.Write(payload)
 			requestBodyW.Write([]byte("\n"))
@@ -234,19 +299,53 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 	}()
 	// write loop -- take messages from response and write to websocket
 	scanner := bufio.NewScanner(responseBodyR)
-	for scanner.Scan() {
-		if len(scanner.Bytes()) == 0 {
-			p.logger.Warnln("[write] empty scan", scanner.Err())
-			continue
+	ticker := time.NewTicker(pingPeriod)
+	writechan := make(chan []byte)
+
+	go func() {
+		for scanner.Scan() {
+			if len(scanner.Bytes()) == 0 {
+				p.logger.Warnln("[scan] empty scan")
+				continue
+			}
+
+			errgrpc := struct {
+				Error interface{} `json:"error"`
+			}{}
+
+			if err := json.Unmarshal(scanner.Bytes(), &errgrpc); err != nil && errgrpc.Error != nil {
+				p.logger.Warnln("[write] grpc error detected :", errgrpc.Error)
+				break
+			}
+
+			p.logger.Debugln("[scan] scanned", scanner.Text())
+			writechan <- scanner.Bytes()
 		}
-		p.logger.Debugln("[write] scanned", scanner.Text())
-		if err = conn.WriteMessage(websocket.TextMessage, scanner.Bytes()); err != nil {
-			p.logger.Warnln("[write] error writing websocket message:", err)
-			return
+
+		if err := scanner.Err(); err != nil {
+			p.logger.Warnln("scanner err:", err)
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		p.logger.Warnln("scanner err:", err)
+		close(writechan)
+	}()
+
+	for {
+		select {
+		case bytes, more := <-writechan:
+			if !more {
+				return
+			}
+			conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err = conn.WriteMessage(websocket.TextMessage, bytes); err != nil {
+				p.logger.Warnln("[write] error writing websocket message:", err)
+				return
+			}
+		case <-ticker.C:
+			p.logger.Debugln("[write] ping")
+			conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := conn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
+				return
+			}
+		}
 	}
 }
 
